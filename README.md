@@ -1,4 +1,6 @@
-# DeepSeek-V4.1-Flash on 4× CMP 170HX — 消费级矿卡跑 671B 混合推理
+# DeepSeek-V4.1-Flash on 4× CMP 170HX — 消费级矿卡跑 508B 混合推理
+
+> 实测参数量：主干 305B + Engram 表 203B ≈ **508B**（从 safetensors header 逐 tensor 统计）
 
 > 在 4 张 **CMP 170HX**（矿卡，64GB HBM2e，单卡 250W，无视频输出）上部署
 > **DeepSeek-V4.1-Flash**（FP8 dense + MXFP4 专家 + Engram 表，总权重约 510GB），
