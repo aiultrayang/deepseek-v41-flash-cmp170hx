@@ -33,18 +33,23 @@
 > Engram 表就是权重分片 `model-00047/00048`（各 94.42GiB，合计 ~190GB），
 > 这是"256GB 显存 + 251GB 内存能跑 510GB 模型"的关键一环。
 
-推理流水线按层切分：`pipeline_layers=[6,6,7,21]`（PP4）。
+推理流水线按层切分：`pipeline_layers=[6,6,6,22]`（PP4）。
 CED 的 20 层 encoder（层 0-19，dense）+ 20 层 decoder（层 20-39，MoE）天然分界——
-最后 20 个 MoE 层全部落在 PP3，正好把 CPU 专家计算集中在单 rank：
+引擎强制要求层 19-39 全部落在最后一个 rank，所以最后 22 层（encoder 末层 + 整个 decoder）
+集中到 PP3，把 CPU 专家计算集中在单 rank：
 
 ```
-PP0 (GPU0) ── layers 0-5    (encoder, dense/attention)
-PP1 (GPU1) ── layers 6-11   (encoder, dense/attention)
-PP2 (GPU2) ── layers 12-18  (encoder, dense/attention)
-PP3 (GPU3) ── layers 19-39  (encoder 末层 + 整个 decoder)
+PP0 (GPU0) ── layers 0-5   (encoder, dense/attention)
+PP1 (GPU1) ── layers 6-11  (encoder, dense/attention)
+PP2 (GPU2) ── layers 12-17 (encoder, dense/attention)
+PP3 (GPU3) ── layers 18-39 (encoder 末 2 层 + 整个 decoder)
                                 └─ 20× MoE 层 routed experts → DRAM (CPU GEMM)
                                 └─ Engram tables → Optane NVMe (O_DIRECT)
 ```
+
+> 这个分层是引擎的硬约束，不是调优选择：`hybrid.py` 校验
+> `sum(layers[:-1]) <= 19`，前三个 rank 合计最多 20 层。想均衡负载只能减少 PP 级数
+> 或改架构，不是改参数能解决的。
 
 ## 软件栈
 
@@ -53,15 +58,17 @@ PP3 (GPU3) ── layers 19-39  (encoder 末层 + 整个 decoder)
 - **并行**：`--pipeline-parallel-size 4 --tensor-parallel-size 1`
   （矿卡间 PCIe 拓扑参差：GPU1↔2 走同一 PHB 桥，其余对跨 root complex，
   TP 需要 all-reduce 频繁同步，PP 只在层边界传激活——纯 PP 最优）
-- **关键环境变量**：
+- **关键环境变量**（生产实际值）：
   ```bash
-  NCCL_P2P_DISABLE=1       # 实测 P2P 拷贝仅 3.7GB/s（PCIe 3.0 x16 单向瓶颈）
-  NCCL_ALGO=Ring           # 且跨 root 的 P2P 要绕路，收益不稳定，统一走共享内存稳妥
+  NCCL_P2P_LEVEL=SYS       # P2P 可用（can_device_access_peer=True）；
+                           # 实测拷贝带宽仅 3.7GB/s（PCIe 3.0 x16 单向瓶颈），
+                           # 走 SYS 级传输而非直连
   NCCL_PROTO=Simple
   VLLM_WORKER_MULTIPROC_METHOD=spawn
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128   # 稀疏 indexer logits 临时张量上限
   ```
+  > 早期尝试过 `NCCL_P2P_DISABLE=1` 强制走共享内存，实测不如放开 P2P。
 - **CUDA MPS**：引擎自动托管 `/tmp/dsv41-mps-*` 实例，
   `CUDA_DEVICE_MAX_CONNECTIONS=16`
 - **原生内核**：需要自编译 `libdsv41_ik.so` + `libdsv41_cuda.so`
@@ -85,7 +92,7 @@ vllm serve /mnt/ssd/models/DeepSeek-V4.1-Flash \
   --default-chat-template-kwargs '{"reasoning_effort":50}' \
   --speculative-config '{"method":"dspark","num_speculative_tokens":3}' \
   --additional-config '{"deepseek_v41_hybrid":{
-      "pipeline_layers":[6,6,7,21],
+      "pipeline_layers":[6,6,6,22],
       "cpu_threads":[24,24],
       "engram_cache_gib":8,
       "host_cache_gib":12,
@@ -96,7 +103,7 @@ vllm serve /mnt/ssd/models/DeepSeek-V4.1-Flash \
 
 | 字段 | 值 | 含义 |
 |---|---|---|
-| `pipeline_layers` | `[6,6,7,21]` | 4 个 PP rank 各承载的层数 |
+| `pipeline_layers` | `[6,6,6,22]` | 4 个 PP rank 各承载的层数（约束：20 层 decoder 即层 19-39 必须全部落在最后一个 rank，所以前三个 rank 合计最多 20 层） |
 | `cpu_threads` | `[24,24]` | **[prefill 线程数, decode 线程数]**——按推理相位运行时热切换（`model_state._set_cpu_phase_threads`：batch 含 prefill 用 24 线程吃满多核对大矩阵 GEMM 的收益，纯 decode 回落 24 线程小 batch 防空转）；与 NUMA 无关（本机单 NUMA），物理核按 socket/core 拓扑自动探测 |
 | `engram_cache_gib` | 8 | Engram 行缓存（GPU 侧 bounded row cache） |
 | `host_cache_gib` | 12 | 主存侧 Engram/host cache |
@@ -118,22 +125,65 @@ fused Markov step 直接在 GPU 上做（shard width 129280，rank 256，BLOCK_N
 注意：PP4 + DSpark 组合下，**启动后首轮有约 1/3 概率输出乱码 token**，
 需要预热若干个请求（warmup）再对外服务——这是实测出来的行为。
 
-## 性能实测（2026-09-30 基准）
+DSpark 的收益高度依赖草稿接受率。自然语言文本上接受率远高于随机 token，
+两者 decode 速度差近一倍（见下方性能实测）。调大 `num_speculative_tokens`
+（参考配置用 7）或用 `enable_adaptive_verification` 动态选档还可以再试，
+但本机尚未做该 A/B。
 
-固定 16K input / 2K output，`request_rate=inf` 突发模式：
+## 性能实测（2026-10-17，V4.1-Flash-1017 权重）
 
-| 并发 | 总输入 tok | 总输出 tok | 输出吞吐 (tok/s) | 总吞吐 (tok/s) |
+### 并发扫描（random 数据集）
+
+`vllm bench serve --dataset-name random`，2048 输入 / 128 输出，`--ignore-eos`，
+每档并发数为并发×4 个请求、2 个预热：
+
+| 并发 | 输出吞吐 (tok/s) | Mean TTFT (ms) | Mean TPOT (ms) | DSpark 接受率 |
 |---|---|---|---|---|
-| 1 | 16,384 | 1,024 | 15.3 | 260.0 |
-| 2 | 16,384 | 1,024 | 23.1 | 392.6 |
-| 4 | 32,768 | 2,048 | 26.9 | 457.6 |
-| 8 | 65,536 | 4,096 | 34.4 | 585.4 |
-| 16 | 131,072 | 8,192 | 37.7 | 640.4 |
+| 1 | 16.7 | 2,118 | 43.7 | 5.3% |
+| 2 | 27.0 | 1,520 | 61.8 | 10.1% |
+| 4 | 34.9 | 1,895 | 95.9 | 7.0% |
+| 8 | 43.1 | 2,101 | 161.0 | 8.9% |
+| 16 | 43.3 | 22,425 | 160.8 | 9.2% |
 
-- **单流 decode**：50+ tok/s（DSpark 投机解码下）
-- **总吞吐随并发稳定增长**，16 并发时接近 640 tok/s
-- KV cache：`524,288 tokens` 预算（8 并发上限），实际池等效 543,619 tokens
-- GPU 显存水位：0.97 utilization，混合 workspace 峰值 ~0.682 GiB/卡
+> **这张表不能当作 decode 速度用。** random 数据集是随机 token 序列，没有语言
+> 结构，DSpark 草稿几乎必然被拒（接受率仅 5-10%，接受长度 1.2-1.3），投机解码
+> 退化成每步 1 token + 3 个 draft 的验证开销。它只适合看并发扩展性。
+
+### 真实文本 decode（生产口径）
+
+自然语言 prompt 请求 1,500 token 输出，流式统计、稳态窗口去掉前 15%：
+
+| 场景 | 全程 decode | 稳态 decode | TTFT |
+|---|---|---|---|
+| 技术长文 | 53.3 tok/s | 53.7 tok/s | 1.05 s |
+| 代码生成 | 54.7 tok/s | 54.2 tok/s | 0.92 s |
+
+**单流真实文本 decode ≈ 54 tok/s**（DSpark 3 草案），与 3 卡参考配置同一量级。
+
+### 资源水位
+
+- KV cache 预算 `524,288 tokens`（8 并发上限），各 PP rank 预留 `[0.24, 0.435, 0.435, 0.693]` GiB
+- 模型加载显存：PP0 44.4 GiB / PP1 41.8 GiB / PP2 42.0 GiB / PP3 28.3 GiB
+- 混合 workspace 峰值 ~0.68-0.79 GiB/卡；GPU 专家缓存命中率 83-91%
+- 主存峰值 ~165 GB（systemd cgroup 统计）
+
+### decode 瓶颈在哪
+
+单流 decode 时 PP3（承载最后 22 层 + 全部 20 个 MoE 层）GPU 利用率只有 ~65%，
+另外三张卡 99-100%；CPU 侧 24 个线程跑满但整机利用率不到 30%（96 线程中的 24 个）。
+`perf record` 采样 PP3 进程 8 秒：
+
+```
+68.6%  libgomp     gomp_barrier_wait_end        ← 线程同步自旋
+ 9.6%  libdsv41_ik  dsv41_avx2::project<2>      ← 真正的 MXFP4 GEMM
+ 5.3%  libdsv41_ik  mul_mat_mxfp4_r8_q8_2_avx2
+ 2.2%  libdsv41_ik  mul_mat_mxfp4_r8_q8_2_avx2<2>
+```
+
+**CPU 线程大部分时间在等同步屏障，不是在算。** 实测本机 8 通道 DDR4-2133
+内存带宽多线程 triad 在 8 线程就饱和到 ~99 GB/s，24/48 线程无额外增益——
+所以单纯调大 `cpu_threads` 没有意义。真正的优化方向是减少 CPU 路由次数
+（提高 GPU 专家缓存命中）和减少 batch 内的同步次数，不是加线程。
 
 ## 踩坑记录（对复现者最重要）
 
@@ -154,6 +204,10 @@ fused Markov step 直接在 GPU 上做（shard width 129280，rank 256，BLOCK_N
    （本机 ~236GB），page cache 会吃掉余量，必要时 `drop_caches`
 7. **API 走 Anthropic 协议也行**：`/v1/messages` 同样可用，
    reasoning 模型 `max_tokens` 建议不低于 512，否则推理段占满、正文为空
+8. **别用 random 数据集测 decode 速度**：随机 token 让 DSpark 接受率掉到 5-10%，
+   测出来的 16.7 tok/s 不是真实速度，真实文本约 54 tok/s。基准要点见性能实测章节
+9. **`cpu_threads` 不是越大越好**：本机内存带宽 8 线程即饱和（~99 GB/s），
+   decode 时 CPU 线程 68% 时间在 `gomp_barrier_wait_end` 自旋
 
 ## 模型与量化格式
 
@@ -186,6 +240,8 @@ fused Markov step 直接在 GPU 上做（shard width 129280，rank 256，BLOCK_N
 - [ ] `libdsv41_ik` / `libdsv41_cuda` 编译文档
 - [ ] 长上下文（128K+）压测数据
 - [ ] 傲腾 vs 普通 NVMe 的 Engram 延迟 A/B 对比数据
+- [ ] DSpark `num_speculative_tokens` 3/5/7 与 `enable_adaptive_verification` 的 A/B
+- [ ] `route_tail_skip=4/5`（有损加速，参考配置宣称 decode +15~24%）的实测
 
 ## 致谢
 
