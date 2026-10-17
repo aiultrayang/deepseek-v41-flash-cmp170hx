@@ -89,7 +89,7 @@ vllm serve /mnt/ssd/models/DeepSeek-V4.1-Flash \
 | 字段 | 值 | 含义 |
 |---|---|---|
 | `pipeline_layers` | `[6,6,7,21]` | 4 个 PP rank 各承载的层数 |
-| `cpu_threads` | `[24,24]` | CPU 专家计算线程分配（两组 NUMA） |
+| `cpu_threads` | `[24,24]` | **[prefill 线程数, decode 线程数]**——按推理相位运行时热切换（`model_state._set_cpu_phase_threads`：batch 含 prefill 用 24 线程吃满多核对大矩阵 GEMM 的收益，纯 decode 回落 24 线程小 batch 防空转）；与 NUMA 无关（本机单 NUMA），物理核按 socket/core 拓扑自动探测 |
 | `engram_cache_gib` | 8 | Engram 行缓存（GPU 侧 bounded row cache） |
 | `host_cache_gib` | 12 | 主存侧 Engram/host cache |
 | `engram_storage` | `ssd` | Engram 表走 SSD O_DIRECT（RAM 模式需 ~344GB 主存，本机不够） |
