@@ -1,6 +1,7 @@
-# DeepSeek-V4.1-Flash on 4× CMP 170HX — 消费级矿卡跑 508B 混合推理
+# DeepSeek-V4.1-Flash on 4× CMP 170HX — 消费级矿卡跑 552B MoE
 
-> 实测参数量：主干 305B + Engram 表 203B ≈ **508B**（从 safetensors header 逐 tensor 统计）
+> 官方口径：**552B 主干参数 + 196B Engram 条件记忆**；每 token 激活参数 **prefill 8B / decode 16B**（CED 架构，top-6 路由）。
+> 磁盘权重 ~510GB：FP8 dense + FP4 专家（量化打包后张量元素数 < 理论参数量）。
 
 > 在 4 张 **CMP 170HX**（矿卡，64GB HBM2e，单卡 250W，无视频输出）上部署
 > **DeepSeek-V4.1-Flash**（FP8 dense + MXFP4 专家 + Engram 表，总权重约 510GB），
