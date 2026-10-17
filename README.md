@@ -1,6 +1,9 @@
 # DeepSeek-V4.1-Flash on 4× CMP 170HX — 消费级矿卡跑 552B MoE
 
-> 官方口径：**552B 主干参数 + 196B Engram 条件记忆**；每 token 激活参数 **prefill 8B / decode 16B**（CED 架构，top-6 路由）。
+> 官方口径：**552B 主干参数 + 196B Engram 条件记忆**；每 token 激活参数 **prefill 8B / decode 16B**。
+> **CED**（Causal Encoder-Decoder）架构：40 层 = 20 层 causal encoder + 20 层 decoder；
+> **CSA2** 稀疏注意力 + **FP4 主 KV 缓存**（E2M1，每 16 通道一个 E4M3 scale）→ 全局 KV 仅 **890 字节/token**（≈V4-Flash 的 1/4）；
+> **SWA Bounded Replay** 使持久 KV 占用 ≈ V4-Flash 的 1/8；预训练 45T tokens，原生 1M 上下文。
 > 磁盘权重 ~510GB：FP8 dense + FP4 专家（量化打包后张量元素数 < 理论参数量）。
 
 > 在 4 张 **CMP 170HX**（矿卡，64GB HBM2e，单卡 250W，无视频输出）上部署
@@ -12,33 +15,35 @@
 | 部件 | 配置 | 备注 |
 |---|---|---|
 | GPU | 4× Intel CMP 170HX（SM80，64GB HBM2e，合计 256GB 显存） | 矿卡：**无 NVLink，PCIe P2P 可用**（GPU1↔GPU2 同 PHB，其余跨 root complex/NODE），单卡功耗上限 **250W** |
-| CPU/内存 | AMD EPYC 7K62 48 核 / 96 线程，单 NUMA，251GB DRAM | 后 20 层 routed experts 常驻内存，CPU 多核算专家 |
+| CPU/内存 | AMD EPYC 7K62 48 核 / 96 线程，单 NUMA，251GB DRAM | decoder 的 20 个 MoE 层 routed experts 常驻内存，CPU 多核算专家 |
 | 存储 | 2TB NVMe（/mnt/ssd，权重分片）+ 343GB Intel Optane P5800X（/mnt/optane，Engram 表 ~190GB） | **显存 + 内存 + SSD 三级分层**；Engram 走傲腾 O_DIRECT 直读 |
 
 ## 核心思路：为什么能跑 510GB 的模型
 
-权重总量约 510GB，显存 256GB 装不下，按 **显存 + 内存 + SSD** 三级分工：
+权重总量约 510GB（552B 主干 + 196B Engram），显存 256GB 装不下，按 **显存 + 内存 + SSD** 三级分工。
+能这样分层的前提是官方 CED 架构把每 token 激活压到 **8B（prefill）/16B（decode）**——
+每步只用一小撮参数，冷参数按需取，延迟被吞吐摊薄：
 
 | 层级 | 容量 | 常驻内容 |
 |---|---|---|
 | **显存**（4×64GB HBM2e） | 256GB | FP8 dense 层、注意力、路由器、shared expert + KV cache（~160GB 权重，其余给 KV/工作区） |
-| **内存**（251GB DRAM） | ~140GB | 后 20 个 MoE 层的 384 个 routed experts（FP4/MXFP4），CPU 多核 GEMM（`cpu_mxfp4` 内核），GPU 只算路由 |
-| **SSD**（NVMe + Optane） | ~190GB | 两组 Engram lookup 表（`engram_num_embeddings ≈ 3.84 亿×2`，head_dim=256，每元素 ~1B fp8+scale），**傲腾 O_DIRECT + Linux AIO 按需直读**，不占 page cache |
+| **内存**（251GB DRAM） | ~140GB | decoder 20 个 MoE 层 × 384 routed experts（FP4/MXFP4），CPU 多核 GEMM（`cpu_mxfp4` 内核），GPU 只算路由 |
+| **SSD**（NVMe + Optane） | ~190GB | **Engram 条件记忆**（官方 196B 参数，按 token 稀疏访问的 lookup 表：`engram_num_embeddings ≈ 3.84 亿×2`，head_dim=256，每元素 ~1B fp8+scale），**傲腾 O_DIRECT + Linux AIO 按需直读**，不占 page cache |
 
 > Engram 表就是权重分片 `model-00047/00048`（各 94.42GiB，合计 ~190GB），
 > 这是"256GB 显存 + 251GB 内存能跑 510GB 模型"的关键一环。
 
-推理流水线按层切分：`pipeline_layers=[6,6,7,21]`（PP4），
-其中前三个 rank 覆盖 6+6+7=19 层dense+注意力，最后一个 rank 承载 21 层
-（含全部 20 个 CPU-MoE 层）。
+推理流水线按层切分：`pipeline_layers=[6,6,7,21]`（PP4）。
+CED 的 20 层 encoder（层 0-19，dense）+ 20 层 decoder（层 20-39，MoE）天然分界——
+最后 20 个 MoE 层全部落在 PP3，正好把 CPU 专家计算集中在单 rank：
 
 ```
-PP0 (GPU0) ── layers 0-5    (dense/attention)
-PP1 (GPU1) ── layers 6-11   (dense/attention)
-PP2 (GPU2) ── layers 12-18  (dense/attention)
-PP3 (GPU3) ── layers 19-39  (attention + 20× CPU-MoE 层)
-                                └─ routed experts → DRAM (CPU GEMM)
-                                └─ engram tables → Optane NVMe (O_DIRECT)
+PP0 (GPU0) ── layers 0-5    (encoder, dense/attention)
+PP1 (GPU1) ── layers 6-11   (encoder, dense/attention)
+PP2 (GPU2) ── layers 12-18  (encoder, dense/attention)
+PP3 (GPU3) ── layers 19-39  (encoder 末层 + 整个 decoder)
+                                └─ 20× MoE 层 routed experts → DRAM (CPU GEMM)
+                                └─ Engram tables → Optane NVMe (O_DIRECT)
 ```
 
 ## 软件栈
@@ -103,6 +108,7 @@ vllm serve /mnt/ssd/models/DeepSeek-V4.1-Flash \
 
 ### DSpark 投机解码
 
+官方组件（semi-autoregressive draft generation with confidence-scheduled verification），
 `--speculative-config '{"method":"dspark","num_speculative_tokens":3}'`：
 vocabulary-sharded Markov head + local argmax reduction，
 draft 通信量 O(2×tp_size) 而非 O(vocab_size)，适合 PP 拓扑。
@@ -153,18 +159,20 @@ fused Markov step 直接在 GPU 上做（shard width 129280，rank 256，BLOCK_N
 
 - 权重格式：FP8（ue8m0 scale，block size [32,32]）dense +
   **FP4/MXFP4 专家**（`expert_dtype: fp4`），由 CPU 内核解包
-- 架构：40 层，`hidden_size=5120`，384 routed experts + 1 shared expert，
-  top-6 routing（`scoring_func=sqrtsoftplus`），MLA 注意力
-  （`qk_rope_head_dim=64`，head_dim=512）
-- 原生上下文 1M（`max_position_embeddings=1048576`），
+- 架构（官方口径）：**CED** 20 encoder + 20 decoder 层；每 MoE 层 1 shared + **384 routed experts，激活 top-6**；
+  注意力 **CSA2**（Full/Reindex/Reuse 三静态模式 + Hierarchical Sparse Indexer），
+  **FP4 主 KV 缓存**（E2M1，每 16 通道一个 E4M3 scale）→ 全局 KV 890 B/token；
+  另有 Single-Pass mHC（Mega-mHC 内核）
+- 原生上下文 1M（预训练 64K 稀疏注意力，34T tokens 处扩到 1M），
   YaRN 16×（original 65536），本部署开放 512K
-- Vision：`image_token_id=129264`，支持图片理解（每请求 1 张）
+- Vision：DeepSeek-ViT（2D-RoPE + 3×3 pixel-unshuffle 下采样）+ 两层 MLP projector，
+  从预训练起即图文联合训练；支持图片理解（每请求 1 张）
 
 ## 与其他矿卡方案对比
 
 | 方案 | 卡 | 权重 | 特点 |
 |---|---|---|---|
-| 本方案 | 4×CMP 170HX (256GB) | 510GB（FP8+FP4+Engram） | 显存+内存+SSD 三级分层，PP4 |
+| 本方案 | 4×CMP 170HX (256GB) | ~510GB（FP8+FP4+Engram） | 显存+内存+SSD 三级分层，PP4 |
 | 纯 GPU 卸载 | 4×CMP 170HX | 全装显存 | 装不下 510GB，只能跑更小量化 |
 | 纯 CPU | 无 GPU | 510GB | 吞吐太低 |
 
