@@ -16,7 +16,7 @@
 |---|---|---|
 | GPU | 4× Intel CMP 170HX（SM80，64GB HBM2e，合计 256GB 显存） | 矿卡：**无 NVLink，PCIe P2P 可用**（GPU1↔GPU2 同 PHB，其余跨 root complex/NODE），单卡功耗上限 **250W** |
 | CPU/内存 | AMD EPYC 7K62 48 核 / 96 线程，单 NUMA，251GB DRAM | decoder 的 20 个 MoE 层 routed experts 常驻内存，CPU 多核算专家 |
-| 存储 | 2TB NVMe（/mnt/ssd，权重分片）+ 343GB Intel Optane P5800X（/mnt/optane，Engram 表 ~190GB） | **显存 + 内存 + SSD 三级分层**；Engram 走傲腾 O_DIRECT 直读 |
+| 存储 | 2TB NVMe（/mnt/ssd，权重分片）+ 343GB Optane SSD（/mnt/optane，Engram 表 ~190GB） | **显存 + 内存 + SSD 三级分层**；Engram 走 Optane O_DIRECT 直读 |
 
 ## 核心思路：为什么能跑 510GB 的模型
 
