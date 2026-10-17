@@ -90,10 +90,10 @@ vllm serve /mnt/ssd/models/DeepSeek-V4.1-Flash \
   --tool-call-parser deepseek_v41 \
   --enable-auto-tool-choice \
   --default-chat-template-kwargs '{"reasoning_effort":50}' \
-  --speculative-config '{"method":"dspark","num_speculative_tokens":3}' \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":3,"enable_adaptive_verification":true}' \
   --additional-config '{"deepseek_v41_hybrid":{
       "pipeline_layers":[6,6,6,22],
-      "cpu_threads":[24,24],
+      "cpu_threads":[48,24],
       "engram_cache_gib":8,
       "host_cache_gib":12,
       "engram_storage":"ssd"}}'
@@ -104,7 +104,7 @@ vllm serve /mnt/ssd/models/DeepSeek-V4.1-Flash \
 | 字段 | 值 | 含义 |
 |---|---|---|
 | `pipeline_layers` | `[6,6,6,22]` | 4 个 PP rank 各承载的层数（约束：20 层 decoder 即层 19-39 必须全部落在最后一个 rank，所以前三个 rank 合计最多 20 层） |
-| `cpu_threads` | `[24,24]` | **[prefill 线程数, decode 线程数]**——按推理相位运行时热切换（`model_state._set_cpu_phase_threads`：batch 含 prefill 用 24 线程吃满多核对大矩阵 GEMM 的收益，纯 decode 回落 24 线程小 batch 防空转）；与 NUMA 无关（本机单 NUMA），物理核按 socket/core 拓扑自动探测 |
+| `cpu_threads` | `[48,24]` | **[prefill 线程数, decode 线程数]**——按推理相位运行时热切换（`model_state._set_cpu_phase_threads`：batch 含 prefill 用 48 线程吃满 48 物理核做大矩阵 GEMM，纯 decode 回落 24 线程）；与 NUMA 无关（本机单 NUMA），物理核按 socket/core 拓扑自动探测 |
 | `engram_cache_gib` | 8 | Engram 行缓存（GPU 侧 bounded row cache） |
 | `host_cache_gib` | 12 | 主存侧 Engram/host cache |
 | `engram_storage` | `ssd` | Engram 表走 SSD O_DIRECT（RAM 模式需 ~344GB 主存，本机不够） |
@@ -125,10 +125,16 @@ fused Markov step 直接在 GPU 上做（shard width 129280，rank 256，BLOCK_N
 注意：PP4 + DSpark 组合下，**启动后首轮有约 1/3 概率输出乱码 token**，
 需要预热若干个请求（warmup）再对外服务——这是实测出来的行为。
 
+`enable_adaptive_verification:true`（2026-10-17 A/B 实测有效）：
+scheduler 侧每步在 K=1/2/3 间自动选档（按期望接受长度/步成本打分，
+需超当前档 3% 才切换），confidence head 权重本模型已带。
+单流 decode 自动在 K=2/3 间摆动，4 并发时自动降到 K=1（并发步成本
+高于单流），等效于给并发场景免去了 2/3 的 draft 验证开销。
+
 DSpark 的收益高度依赖草稿接受率。自然语言文本上接受率远高于随机 token，
-两者 decode 速度差近一倍（见下方性能实测）。调大 `num_speculative_tokens`
-（参考配置用 7）或用 `enable_adaptive_verification` 动态选档还可以再试，
-但本机尚未做该 A/B。
+两者 decode 速度差近一倍（见下方性能实测）。`num_speculative_tokens`
+调大到 7 的参考配置在本机未实测；逐位置接受率 0.65/0.38/0.24 表明
+第 4 个之后收益很低，不建议盲调。
 
 ## 性能实测（2026-10-17，V4.1-Flash-1017 权重）
 
@@ -151,14 +157,23 @@ DSpark 的收益高度依赖草稿接受率。自然语言文本上接受率远�
 
 ### 真实文本 decode（生产口径）
 
-自然语言 prompt 请求 1,500 token 输出，流式统计、稳态窗口去掉前 15%：
+自然语言 prompt 流式统计、稳态窗口去掉前 15%。**2026-10-17 晚优化后**
+（`cpu_threads=[48,24]` + `--max-num-batched-tokens 4096` +
+`enable_adaptive_verification:true`，DSpark 3 草案）：
 
 | 场景 | 全程 decode | 稳态 decode | TTFT |
 |---|---|---|---|
-| 技术长文 | 53.3 tok/s | 53.7 tok/s | 1.05 s |
-| 代码生成 | 54.7 tok/s | 54.2 tok/s | 0.92 s |
+| 单流技术长文（3000 tok） | 50.3-54.6 tok/s | 50.1-54.4 tok/s | — |
+| 4 并发（每流 mean） | 24.7-26.4 tok/s | — | 0.6-4.5 s |
+| 4 并发（聚合吞吐） | 98.7-105.4 tok/s | — | — |
 
-**单流真实文本 decode ≈ 54 tok/s**（DSpark 3 草案），与 3 卡参考配置同一量级。
+对比优化前基线（`cpu_threads=[24,24]` + batched 2048 + 固定 K=3）：
+单流 50.1-53.4 tok/s（基本持平，单流本就接近 CPU 内存带宽上限），
+**4 并发每流 22.9 → 24.7-26.4 tok/s（+8~15%），聚合 91.4 → 98.7-105.4 tok/s**。
+
+> 单流速度瓶颈在 DDR4 内存带宽（~99 GB/s 饱和）与 `gomp_barrier` 自旋，
+> 参数层能榨的收益有限；4 并发收益主要来自 adaptive verification 在
+> 高并发下自动降到 K=1，减少无效 draft 验证。
 
 ### 资源水位
 
@@ -182,8 +197,10 @@ DSpark 的收益高度依赖草稿接受率。自然语言文本上接受率远�
 
 **CPU 线程大部分时间在等同步屏障，不是在算。** 实测本机 8 通道 DDR4-2133
 内存带宽多线程 triad 在 8 线程就饱和到 ~99 GB/s，24/48 线程无额外增益——
-所以单纯调大 `cpu_threads` 没有意义。真正的优化方向是减少 CPU 路由次数
-（提高 GPU 专家缓存命中）和减少 batch 内的同步次数，不是加线程。
+所以 decode 相位单纯调大 `cpu_threads` 没有意义（A/B 实测 [24,32] 与 [24,8]
+均差于 [24,24]，[48,24] 靠 prefill 提速带动 TTFT）。真正的优化方向是
+减少 CPU 路由次数（提高 GPU 专家缓存命中）、减少 batch 内的同步次数
+和 adaptive verification 降低验证开销，不是加线程。
 
 ## 踩坑记录（对复现者最重要）
 
