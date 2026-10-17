@@ -14,8 +14,8 @@
 
 | 部件 | 配置 | 备注 |
 |---|---|---|
-| GPU | 4× Intel CMP 170HX（SM80，64GB HBM2e，合计 256GB 显存） | 矿卡：**无 NVLink，PCIe P2P 可用**（GPU1↔GPU2 同 PHB，其余跨 root complex/NODE），单卡功耗上限 **250W** |
-| CPU/内存 | AMD EPYC 7K62 48 核 / 96 线程，单 NUMA，251GB DRAM | decoder 的 20 个 MoE 层 routed experts 常驻内存，CPU 多核算专家 |
+| GPU | 4× NVIDIA CMP 170HX（GA100，SM80，64GB HBM2e，合计 256GB 显存） | 矿卡：**无 NVLink，PCIe P2P 可用**（GPU1↔GPU2 同 PHB，其余跨 root complex/NODE），单卡功耗上限 **250W**（最大可调 300W，实测负载仅 40-72W） |
+| CPU/内存 | AMD EPYC 7K62 48 核 / 96 线程，单 NUMA，251GB DRAM | 20 个 CPU 专家层的 routed experts 常驻内存，CPU 多核算专家 |
 | 存储 | 2TB NVMe（/mnt/ssd，权重分片）+ 343GB Optane SSD（/mnt/optane，Engram 表 ~190GB） | **显存 + 内存 + SSD 三级分层**；Engram 走 Optane O_DIRECT 直读 |
 
 ## 核心思路：为什么能跑 510GB 的模型
@@ -27,23 +27,25 @@
 | 层级 | 容量 | 常驻内容 |
 |---|---|---|
 | **显存**（4×64GB HBM2e） | 256GB | FP8 dense 层、注意力、路由器、shared expert + KV cache（~160GB 权重，其余给 KV/工作区） |
-| **内存**（251GB DRAM） | ~140GB | decoder 20 个 MoE 层 × 384 routed experts（FP4/MXFP4），CPU 多核 GEMM（`cpu_mxfp4` 内核），GPU 只算路由 |
+| **内存**（251GB DRAM） | ~140GB | 20 个 CPU 专家层 × 384 routed experts（FP4/MXFP4），CPU 多核 GEMM（`cpu_mxfp4` 内核），GPU 只算路由 |
 | **SSD**（NVMe + Optane） | ~190GB | **Engram 条件记忆**（官方 196B 参数，按 token 稀疏访问的 lookup 表：`engram_num_embeddings ≈ 3.84 亿×2`，head_dim=256，每元素 ~1B fp8+scale），**傲腾 O_DIRECT + Linux AIO 按需直读**，不占 page cache |
 
-> Engram 表就是权重分片 `model-00047/00048`（各 94.42GiB，合计 ~190GB），
+> Engram 表就是权重分片 `model-00047/00048`（软链到 /mnt/optane，各 94.42GiB，
+> 合计 ~190GB）。全部 48 个分片（含软链）合计 **475.3 GiB（≈510 GB）**，
 > 这是"256GB 显存 + 251GB 内存能跑 510GB 模型"的关键一环。
 
 推理流水线按层切分：`pipeline_layers=[6,6,6,22]`（PP4）。
-CED 的 20 层 encoder（层 0-19，dense）+ 20 层 decoder（层 20-39，MoE）天然分界——
-引擎强制要求层 19-39 全部落在最后一个 rank，所以最后 22 层（encoder 末层 + 整个 decoder）
-集中到 PP3，把 CPU 专家计算集中在单 rank：
+全部 40 层都是 MoE 层（权重索引实测每层 384 个 routed experts），但
+CPU 专家路径只开在层 20-39（`cpu_moe.py` 默认 `start_layer=20`），
+且引擎强制要求层 19-39 全部落在最后一个 rank——所以最后 22 层
+（层 19 + CPU 专家层 20-39）集中到 PP3，把 CPU 专家计算集中在单 rank：
 
 ```
-PP0 (GPU0) ── layers 0-5   (encoder, dense/attention)
-PP1 (GPU1) ── layers 6-11  (encoder, dense/attention)
-PP2 (GPU2) ── layers 12-17 (encoder, dense/attention)
-PP3 (GPU3) ── layers 18-39 (encoder 末 2 层 + 整个 decoder)
-                                └─ 20× MoE 层 routed experts → DRAM (CPU GEMM)
+PP0 (GPU0) ── layers 0-5    (GPU 全量层：dense expert GEMM 在卡上)
+PP1 (GPU1) ── layers 6-11   (同上)
+PP2 (GPU2) ── layers 12-17  (同上)
+PP3 (GPU3) ── layers 18-39  (层 19 + CPU 专家层 20-39)
+                                └─ 20× CPU MoE 层 routed experts → DRAM (CPU GEMM)
                                 └─ Engram tables → Optane NVMe (O_DIRECT)
 ```
 
@@ -61,8 +63,9 @@ PP3 (GPU3) ── layers 18-39 (encoder 末 2 层 + 整个 decoder)
 - **关键环境变量**（生产实际值）：
   ```bash
   NCCL_P2P_LEVEL=SYS       # P2P 可用（can_device_access_peer=True）；
-                           # 实测拷贝带宽仅 3.7GB/s（PCIe 3.0 x16 单向瓶颈），
-                           # 走 SYS 级传输而非直连
+                           # PCIe 3.0 x16（5GT/s，实测链路即 5GT/s），
+                           # 拷贝带宽 ~3.7GB/s；GPU1↔GPU2 走 PHB 直连，
+                           # 跨 root complex 对走 SYS 级传输
   NCCL_PROTO=Simple
   VLLM_WORKER_MULTIPROC_METHOD=spawn
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -103,7 +106,7 @@ vllm serve /mnt/ssd/models/DeepSeek-V4.1-Flash \
 
 | 字段 | 值 | 含义 |
 |---|---|---|
-| `pipeline_layers` | `[6,6,6,22]` | 4 个 PP rank 各承载的层数（约束：20 层 decoder 即层 19-39 必须全部落在最后一个 rank，所以前三个 rank 合计最多 20 层） |
+| `pipeline_layers` | `[6,6,6,22]` | 4 个 PP rank 各承载的层数（约束：CPU 专家层 19-39 必须全部落在最后一个 rank，所以前三个 rank 合计最多 20 层） |
 | `cpu_threads` | `[48,24]` | **[prefill 线程数, decode 线程数]**——按推理相位运行时热切换（`model_state._set_cpu_phase_threads`：batch 含 prefill 用 48 线程吃满 48 物理核做大矩阵 GEMM，纯 decode 回落 24 线程）；与 NUMA 无关（本机单 NUMA），物理核按 socket/core 拓扑自动探测 |
 | `engram_cache_gib` | 8 | Engram 行缓存（GPU 侧 bounded row cache） |
 | `host_cache_gib` | 12 | 主存侧 Engram/host cache |
@@ -177,10 +180,13 @@ DSpark 的收益高度依赖草稿接受率。自然语言文本上接受率远�
 
 ### 资源水位
 
-- KV cache 预算 `524,288 tokens`（8 并发上限），各 PP rank 预留 `[0.24, 0.435, 0.435, 0.693]` GiB
-- 模型加载显存：PP0 44.4 GiB / PP1 41.8 GiB / PP2 42.0 GiB / PP3 28.3 GiB
-- 混合 workspace 峰值 ~0.68-0.79 GiB/卡；GPU 专家缓存命中率 83-91%
-- 主存峰值 ~165 GB（systemd cgroup 统计）
+- KV cache 预算 `524,288 tokens`（8 并发上限）；优化后各 PP rank
+  `Hybrid cache budget`：KV `[0.295, 0.535, 0.535, 0.852]` GiB、
+  expert budget `[10.6, 12.8, 12.6, 24.1]` GiB
+- GPU 专家缓存覆盖 43.33%（3328/7680 routed experts，58.3 GiB），
+  运行时命中率 78-87%（负载相关），host LRU 11.2 GiB
+- 混合 workspace 峰值 ~1.3-1.6 GiB/卡
+- 主存峰值 ~165 GB（systemd cgroup 统计）；启动前需 MemAvailable ≥ ~236GB
 
 ### decode 瓶颈在哪
 
@@ -206,11 +212,10 @@ DSpark 的收益高度依赖草稿接受率。自然语言文本上接受率远�
 
 1. **Engram 存储**：`engram_storage="ram"` 需 ~344GB 主存（251GB 机器不行），
    用 `ssd` 模式走 O_DIRECT + Linux AIO（非 GDS），~190GB 表按需直读傲腾
-   （host workspace 仅 ~18.2 MiB，GPU workspace 12.4 MiB，另有 4GiB bounded row cache）。
-   host workspace 只需要 ~18.2 MiB，GPU workspace 12.4 MiB
-2. **Engram 表放傲腾**：`/mnt/optane/model-00047/00048.safetensors` ——
-   这两个 94.42GiB 的文件（合计 ~190GB）实际是 Engram 表而非常规权重，
-   O_DIRECT 按需读，傲腾的低随机读延迟正好吃满
+   （host workspace 仅 ~32.5 MiB，GPU workspace 24.8 MiB，另有 4GiB bounded row cache）
+2. **Engram 表放傲腾**：`/mnt/optane/model-00047/00048-of-00048.safetensors`
+   （模型目录内以软链形式挂入）——这两个 94.42GiB 的文件（合计 ~190GB）
+   实际是 Engram 表而非常规权重，O_DIRECT 按需读，傲腾的低随机读延迟正好吃满
 3. **Warmup 必开**：PP4+DSpark 首轮请求乱码问题，启动后发 8 个预热请求解决
 4. **MPS 残留**：每次 PP4 启动会派生 `nvidia-cuda-mps-server`，
    旧实例不自动退出（每轮吃 1~1.5GB 主存），重启脚本要显式清理
@@ -230,10 +235,15 @@ DSpark 的收益高度依赖草稿接受率。自然语言文本上接受率远�
 
 - 权重格式：FP8（ue8m0 scale，block size [32,32]）dense +
   **FP4/MXFP4 专家**（`expert_dtype: fp4`），由 CPU 内核解包
-- 架构（官方口径）：**CED** 20 encoder + 20 decoder 层；每 MoE 层 1 shared + **384 routed experts，激活 top-6**；
-  注意力 **CSA2**（Full/Reindex/Reuse 三静态模式 + Hierarchical Sparse Indexer），
+- 架构（官方口径 + 权重索引实测）：**CED** 20 encoder + 20 decoder 层，
+  **40 层全部是 MoE**（每层权重里都有 384 routed experts）；
+  CPU 混合推理只把层 20-39 的 routed experts 放 DRAM，层 0-19 的
+  专家权重仍按 FP4 打包在 GPU 上由 dense 内核计算；
+  每 MoE 层 1 shared + 384 routed experts，激活 top-6；
+  注意力 **CSA2**（Full/Reindex/Reuse 三静态模式 + Hierarchical Sparse Indexer，
+  compressor/indexer 仅在层 2/8/14/20 与 indexer 源层 24/28/32/36 出现），
   **FP4 主 KV 缓存**（E2M1，每 16 通道一个 E4M3 scale）→ 全局 KV 890 B/token；
-  另有 Single-Pass mHC（Mega-mHC 内核）
+  另有 Single-Pass mHC（Mega-mHC 内核）；Engram 挂在层 1/14
 - 原生上下文 1M（预训练 64K 稀疏注意力，34T tokens 处扩到 1M），
   YaRN 16×（original 65536），本部署开放 512K
 - Vision：DeepSeek-ViT（2D-RoPE + 3×3 pixel-unshuffle 下采样）+ 两层 MLP projector，
@@ -257,7 +267,8 @@ DSpark 的收益高度依赖草稿接受率。自然语言文本上接受率远�
 - [ ] `libdsv41_ik` / `libdsv41_cuda` 编译文档
 - [ ] 长上下文（128K+）压测数据
 - [ ] 傲腾 vs 普通 NVMe 的 Engram 延迟 A/B 对比数据
-- [ ] DSpark `num_speculative_tokens` 3/5/7 与 `enable_adaptive_verification` 的 A/B
+- [x] DSpark `enable_adaptive_verification` A/B（2026-10-17 完成，4 并发 +8~15%）
+- [ ] DSpark `num_speculative_tokens` 3/5/7 扫描（接受率 0.65/0.38/0.24，预期收益低）
 - [ ] `route_tail_skip=4/5`（有损加速，参考配置宣称 decode +15~24%）的实测
 
 ## 致谢
