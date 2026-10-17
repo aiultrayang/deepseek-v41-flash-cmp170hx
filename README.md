@@ -130,7 +130,7 @@ fused Markov step 直接在 GPU 上做（shard width 129280，rank 256，BLOCK_N
 | 8 | 65,536 | 4,096 | 34.4 | 585.4 |
 | 16 | 131,072 | 8,192 | 37.7 | 640.4 |
 
-- **单流 decode**：~15-20 tok/s（PP 流水线深度限制，首 token 延迟受流水线影响）
+- **单流 decode**：50+ tok/s（DSpark 投机解码下）
 - **总吞吐随并发稳定增长**，16 并发时接近 640 tok/s
 - KV cache：`524,288 tokens` 预算（8 并发上限），实际池等效 543,619 tokens
 - GPU 显存水位：0.97 utilization，混合 workspace 峰值 ~0.682 GiB/卡
