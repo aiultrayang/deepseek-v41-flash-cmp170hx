@@ -9,6 +9,9 @@
 > 在 4 张 **CMP 170HX**（矿卡，64GB HBM2e，单卡 250W，无视频输出）上部署
 > **DeepSeek-V4.1-Flash**（FP8 dense + MXFP4 专家 + Engram 表，总权重约 510GB），
 > 通过 **CPU/GPU 混合推理**实现 512K 上下文在线服务。
+>
+> **另有三卡 PP3 方案**（完全复刻 buliaoyin/vllm-backport 官方 README，
+> 留出 1 张卡做测试）：见 [docs/pp3-3card-plan.md](docs/pp3-3card-plan.md)。
 
 ## 硬件
 
@@ -268,6 +271,7 @@ DSpark 的收益高度依赖草稿接受率。自然语言文本上接受率远�
 - [ ] 长上下文（128K+）压测数据
 - [ ] 傲腾 vs 普通 NVMe 的 Engram 延迟 A/B 对比数据
 - [x] DSpark `enable_adaptive_verification` A/B（2026-10-17 完成，4 并发 +8~15%）
+- [x] 三卡 PP3 复刻方案与资源/速度总结（2026-10-18，见 [docs/pp3-3card-plan.md](docs/pp3-3card-plan.md)）
 - [ ] DSpark `num_speculative_tokens` 3/5/7 扫描（接受率 0.65/0.38/0.24，预期收益低）
 - [ ] `route_tail_skip=4/5`（有损加速，参考配置宣称 decode +15~24%）的实测
 
