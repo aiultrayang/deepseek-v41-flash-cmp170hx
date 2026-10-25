@@ -346,3 +346,6 @@ bash bench/bench-8001-full.sh
 
 > ⚠️ **版本锁死**：补丁 `index` 基于 `abc503f..4ef765f` 这对 blob。上游一动 `engram.py` / `gpu_worker.py`，
 > 38 KB 补丁就 conflict。所以镜像锁 digest，不跟 `:latest`。
+
+> **许可证**：`patches/` 与 `native/` 的内容是对 vLLM（Apache-2.0）及其下游分支的修改，
+> 沿用上游许可证；`build/`、`bench/` 为本仓库原创脚本。
