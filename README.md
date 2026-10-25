@@ -1,4 +1,6 @@
-# DeepSeek-V4.1-Flash on 4× CMP 170HX — 消费级矿卡跑 552B MoE
+# DeepSeek-V4.1-Flash on CMP 170HX 矿卡 — PP3 / PP4 / PP6 三套部署方案
+
+> 主文档：**4× CMP 170HX 上跑 552B MoE（PP4 + 内存 + 傲腾 SSD 三级分层）**
 
 > 官方口径：**552B 主干参数 + 196B Engram 条件记忆**；每 token 激活参数 **prefill 8B / decode 16B**。
 > **CED**（Causal Encoder-Decoder）架构：40 层 = 20 层 causal encoder + 20 层 decoder；
@@ -12,6 +14,22 @@
 >
 > **另有三卡 PP3 方案**（完全复刻 buliaoyin/vllm-backport 官方 README，
 > 留出 1 张卡做测试）：见 [docs/pp3-3card-plan.md](docs/pp3-3card-plan.md)。
+>
+> **另有六卡 PP6 + Engram-SSD 方案**（8× CMP170HX 只用 6 张卡，不用 CPU 计算，
+> Engram 表直接从 NVMe `O_DIRECT` 流式读）：见 [pp6-ssd/README.md](pp6-ssd/README.md)。
+
+## 三套方案总览（同一模型，三种分层哲学）
+
+| | PP3（3 卡） | PP4（本文档） | **PP6 + SSD（6 卡）** |
+|---|---|---|---|
+| 文档 | [docs/pp3-3card-plan.md](docs/pp3-3card-plan.md) | 本 README | [pp6-ssd/README.md](pp6-ssd/README.md) |
+| 卡数 / 显存 | 3 卡 | 4 卡 / 256 GB | **8 卡机用 6 卡 / 384 GB** |
+| 分层 | 显存 + DRAM + SSD | 显存 + DRAM（CPU 专家）+ 傲腾 SSD | **显存 + NVMe（无内存层）** |
+| Engram 存放 | Optane SSD | Optane SSD | **系统 NVMe** |
+| 引擎分支 | `buliaoyin` 官方 README | `codex/deepseek-v41-cpu-hybrid` | **vLLM 0.13.1 + 两补丁** |
+| 层切分 | — | `[6,6,6,22]` | **`7,7,7,7,7,5`** |
+| 单流 decode | — | 50–54 tok/s | **140 tok/s** |
+| 特点 | 留一张卡做测试 | CPU 分担 20 层 MoE | PP6 流水 + SSD 直读，吞吐最高 |
 
 ## 硬件
 
@@ -256,13 +274,18 @@ DSpark 的收益高度依赖草稿接受率。自然语言文本上接受率远�
 
 | 方案 | 卡 | 权重 | 特点 |
 |---|---|---|---|
-| 本方案 | 4×CMP 170HX (256GB) | ~510GB（FP8+FP4+Engram） | 显存+内存+SSD 三级分层，PP4 |
+| 本方案（PP4） | 4×CMP 170HX (256GB) | ~510GB（FP8+FP4+Engram） | 显存+内存+SSD 三级分层，CPU 承担 20 层 MoE |
+| [PP6 + SSD](pp6-ssd/README.md) | 6×CMP 170HX (384GB) | 475 GiB（FP8 + Engram 189G 落盘） | 无内存层，Engram 从 NVMe 直读，单流 140 tok/s、c8 聚合 755 tok/s |
 | 纯 GPU 卸载 | 4×CMP 170HX | 全装显存 | 装不下 510GB，只能跑更小量化 |
 | 纯 CPU | 无 GPU | 510GB | 吞吐太低 |
 
 核心洞察：**CMP 170HX 的 64GB HBM2e 大显存 + 250W 低功耗，
 天然适合"PP 流水线 + 显存/内存/SSD 三级专家分层"而非 TP** ——
 矿卡的容量优势被放大，PCIe 拓扑参差与 P2P 带宽瓶颈被 PP 架构规避。
+
+两套 GPU 方案的取舍：**卡不够就借 CPU 内存（PP4），卡够就纯 GPU + SSD 直读（PP6）**。
+PP6 把 CPU 从计算路径上彻底移除，换来单流 2.6× 与 c8 聚合 7× 的提升，
+代价是要吃 6 张卡、且 Engram 的 NVMe 随机读成为新的长尾瓶颈。
 
 ## 待完善
 
@@ -272,10 +295,15 @@ DSpark 的收益高度依赖草稿接受率。自然语言文本上接受率远�
 - [ ] 傲腾 vs 普通 NVMe 的 Engram 延迟 A/B 对比数据
 - [x] DSpark `enable_adaptive_verification` A/B（2026-10-17 完成，4 并发 +8~15%）
 - [x] 三卡 PP3 复刻方案与资源/速度总结（2026-10-18，见 [docs/pp3-3card-plan.md](docs/pp3-3card-plan.md)）
+- [x] 六卡 PP6 + Engram-SSD 方案与四轮基准（2026-10-24，见 [pp6-ssd/README.md](pp6-ssd/README.md)）
+- [ ] PP6 的 `engram_cache_gib` 8 → 16/24/32 GiB A/B（覆盖 4.2% → 8.5/12.7/16.9% 的表）
 - [ ] DSpark `num_speculative_tokens` 3/5/7 扫描（接受率 0.65/0.38/0.24，预期收益低）
 - [ ] `route_tail_skip=4/5`（有损加速，参考配置宣称 decode +15~24%）的实测
 
 ## 致谢
 
 - DeepSeek 开源 [DeepSeek-V4.1-Flash](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4.1-Flash)
-- `buliaoyin/vllm-backport` 的 CPU/GPU 混合推理分支
+- `buliaoyin/vllm-backport` 的 CPU/GPU 混合推理分支（PP4 方案）
+- `wtdcode/vllm-backport` 与 `lazymio/vllm-backport` 基础镜像（PP6 的地基）
+- `344303947/dsv41-flash-pp5-170hx`（PP5/PP6、SM80 适配、dspark）
+- `canoziia` 的 PP communicator primer、`buliaoyin` 谱系的 Engram-SSD 后端（PP6 的两个补丁）

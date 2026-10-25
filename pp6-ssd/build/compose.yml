@@ -1,0 +1,78 @@
+services:
+  deepseek-v41:
+    image: ${DSV41_IMAGE:-dsv41-pp6-engram-ssd:port1}
+    container_name: ${DSV41_NAME:-dsv41-ssd}
+    runtime: nvidia
+    restart: "no"                # 冷启动 ~95min，失败要人看日志，不要自动重启
+    network_mode: host
+    shm_size: "16gb"             # PP worker 多进程共享内存
+    stop_grace_period: 10m       # 6 个 worker 收尾要时间，太短会留僵尸进程
+
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "${DSV41_GPUS:-0,1,2,3,4,5}"   # 8 卡机只用 6 卡
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      CUDA_DEVICE_ORDER: "PCI_BUS_ID"
+      HF_HUB_OFFLINE: "1"
+      VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+      VLLM_PP_LAYER_PARTITION: "7,7,7,7,7,5"
+      VLLM_CPU_OFFLOAD_GB_PER_RANK: "0,0,0,0,0,0"   # 关掉 vLLM 自带 CPU offload，Engram 走 SSD 通道
+      VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
+      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "128"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      NCCL_ALGO: "Ring"
+      NCCL_PROTO: "Simple"
+      NCCL_P2P_DISABLE: "1"        # CMP 170HX 不支持 P2P
+      NCCL_IB_DISABLE: "1"
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /root/.cache/tmp
+
+    ulimits:
+      nofile:
+        soft: 1048576              # AIO + 多 worker 的 fd 需求
+        hard: 1048576
+
+    # 宿主路径 → 容器内**同路径**挂载，这样模型目录里的符号链接树不会断。
+    # 把 DSV41_ROOT / CKPT_ROOT 按你的机器改到 .env 里即可。
+    volumes:
+      - ${DSV41_ROOT:-/srv/dsv41}:${DSV41_ROOT:-/srv/dsv41}:ro
+      - ${CKPT_ROOT:-/data/checkpoints}:${CKPT_ROOT:-/data/checkpoints}:ro
+      - ${DSV41_ROOT:-/srv/dsv41}/cache:/root/.cache
+
+    # EAGER=1 时追加 --enforce-eager（仅首启正确性验证档，生产勿开：约 3× 慢）
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - |
+        set -e
+        EXTRA=""
+        if [ "${EAGER:-0}" = "1" ]; then EXTRA="--enforce-eager"; fi
+        exec vllm serve $${MODEL_PATH:-/srv/dsv41/model/DeepSeek-V4.1-Flash} \
+          --host=0.0.0.0 \
+          --port=$${PORT:-8001} \
+          --served-model-name=$${SERVED_NAME:-DeepSeek-V4.1-Flash} \
+          --pipeline-parallel-size=6 \
+          --tensor-parallel-size=1 \
+          --max-model-len=1048576 \
+          --max-num-batched-tokens=4096 \
+          --max-num-seqs=32 \
+          --kv-cache-dtype=fp8_ds_mla \
+          --kv-cache-memory=4294967296 \
+          --trust-remote-code \
+          --disable-custom-all-reduce \
+          --enable-prefix-caching \
+          --safetensors-load-strategy=lazy \
+          '--engram-config={"cpu_offload":true,"storage":"ssd","engram_cache_gib":8}' \
+          '--speculative-config={"method":"dspark","num_speculative_tokens":5,"use_local_argmax_reduction":true}' \
+          --tokenizer-mode=deepseek_v41 \
+          --enable-auto-tool-choice \
+          '--structured-outputs-config={"backend":"auto","disable_any_whitespace":false}' \
+          --tool-call-parser=deepseek_v41 \
+          --reasoning-parser=deepseek_v41 \
+          --enable-prompt-tokens-details \
+          $$EXTRA
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:$${PORT:-8001}/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120m          # 冷启动 ~95min，默认 30s 会一直判不健康
+      retries: 3

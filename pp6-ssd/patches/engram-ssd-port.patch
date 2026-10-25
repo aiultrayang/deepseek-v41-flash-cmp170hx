@@ -1,0 +1,1003 @@
+diff --git a/csrc/cpu/dsv41/engram_ssd.cpp b/csrc/cpu/dsv41/engram_ssd.cpp
+new file mode 100644
+index 0000000..a584713
+--- /dev/null
++++ b/csrc/cpu/dsv41/engram_ssd.cpp
+@@ -0,0 +1,387 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++#include <cuda_runtime_api.h>
++#include <fcntl.h>
++#include <linux/aio_abi.h>
++#include <sys/stat.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cerrno>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace {
++constexpr size_t page_size = 4096;
++constexpr size_t batch_pages = 1024;
++constexpr size_t queue_depth = 128;
++using Clock = std::chrono::steady_clock;
++
++uint64_t ns(Clock::time_point start) {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() -
++                                                              start)
++      .count();
++}
++
++struct Source {
++  int fd = -1;
++  uint64_t offset = 0, size = 0;
++  ~Source() {
++    if (fd >= 0) close(fd);
++  }
++  void open_file(const char* path, uint64_t base, uint64_t bytes) {
++    fd = open(path, O_RDONLY | O_DIRECT | O_CLOEXEC);
++    if (fd < 0)
++      throw std::runtime_error("Engram open(O_DIRECT): " +
++                               std::string(std::strerror(errno)));
++    struct stat info{};
++    if (fstat(fd, &info) || !S_ISREG(info.st_mode))
++      throw std::runtime_error("Engram SSD requires a regular file");
++    size = info.st_size;
++    offset = base;
++    if (base > size || bytes > size - base)
++      throw std::runtime_error("Engram tensor extends beyond checkpoint file");
++  }
++};
++
++struct Piece {
++  uint64_t page;
++  uint32_t output;
++  uint16_t begin, length;
++};
++
++struct CacheEntry {
++  uint64_t age = 0;
++  uint32_t id = UINT32_MAX;
++};
++
++struct Reader {
++  Source weights, scales;
++  aio_context_t context = 0;
++  void* pages = nullptr;
++  int device = 0, dim, scale_dim, max_rows, vocab_start, vocab_end;
++  const int32_t* ids;
++  uint8_t* output;
++  int32_t* status;
++  std::atomic<bool> failed{false};
++  char error[512]{};
++  std::vector<Piece> pieces;
++  std::vector<int> misses;
++  std::vector<CacheEntry> cache;
++  std::vector<uint8_t> cached_rows;
++  size_t cache_sets = 0;
++  uint64_t clock = 0;
++  std::array<iocb, batch_pages> requests{};
++  std::array<iocb*, batch_pages> request_ptrs{};
++  std::array<uint64_t, batch_pages> offsets{};
++  std::array<io_event, queue_depth> completions{};
++  // calls, rows, valid rows, weight pages, scale pages, read bytes, read ops,
++  // planning ns, IO ns, total callback ns, cached rows.
++  std::array<uint64_t, 11> stats{};
++
++  Reader(int dim_, int scale_dim_, int max_rows_, int start, int end,
++         uint64_t cache_bytes, const int32_t* ids_, uint8_t* output_,
++         int32_t* status_)
++      : dim(dim_),
++        scale_dim(scale_dim_),
++        max_rows(max_rows_),
++        vocab_start(start),
++        vocab_end(end),
++        ids(ids_),
++        output(output_),
++        status(status_) {
++    if (dim <= 0 || dim > page_size || scale_dim <= 0 ||
++        scale_dim > page_size || max_rows <= 0 || start < 0 || end <= start ||
++        uint64_t(max_rows) * (dim + scale_dim) > UINT32_MAX)
++      throw std::runtime_error("Invalid Engram SSD workspace geometry");
++    if (cudaGetDevice(&device) != cudaSuccess)
++      throw std::runtime_error("Cannot determine Engram SSD CUDA device");
++    pieces.reserve(size_t(max_rows) * 2);
++    misses.reserve(max_rows);
++    cache_sets = cache_bytes / (4 * (dim + scale_dim + sizeof(CacheEntry)));
++    cache.resize(cache_sets * 4);
++    cached_rows.resize(cache.size() * (dim + scale_dim));
++    if (posix_memalign(&pages, page_size, batch_pages * page_size))
++      throw std::bad_alloc();
++    if (syscall(SYS_io_setup, queue_depth, &context)) {
++      free(pages);
++      pages = nullptr;
++      throw std::runtime_error("Engram io_setup: " +
++                               std::string(std::strerror(errno)));
++    }
++  }
++  ~Reader() {
++    if (context) syscall(SYS_io_destroy, context);
++    free(pages);
++  }
++
++  void fail(const char* message) {
++    if (!failed.load(std::memory_order_relaxed)) {
++      std::snprintf(error, sizeof(error), "%s", message);
++      std::fprintf(stderr, "Engram SSD read failed: %s\n", error);
++      failed.store(true, std::memory_order_release);
++    }
++    *status = 1;
++  }
++
++  size_t cache_set(uint32_t id) const {
++    uint64_t hash = uint64_t(id) * 0x9e3779b97f4a7c15ULL;
++    return ((hash >> 32) ^ hash) % cache_sets * 4;
++  }
++
++  void fill_cached(int rows) {
++    misses.clear();
++    const size_t width = dim + scale_dim;
++    for (int row = 0; row < rows; ++row) {
++      const int id = ids[row];
++      if (id < vocab_start || id >= vocab_end) continue;
++      ++stats[2];
++      bool hit = false;
++      if (cache_sets) {
++        size_t set = cache_set(id);
++        for (size_t slot = set; slot < set + 4; ++slot) {
++          if (cache[slot].id != uint32_t(id)) continue;
++          cache[slot].age = ++clock;
++          std::memcpy(output + row * width, cached_rows.data() + slot * width,
++                      width);
++          ++stats[10];
++          hit = true;
++          break;
++        }
++      }
++      if (!hit) misses.push_back(row);
++    }
++  }
++
++  void update_cache() {
++    if (!cache_sets) return;
++    const size_t width = dim + scale_dim;
++    for (int row : misses) {
++      const uint32_t id = ids[row];
++      size_t set = cache_set(id), victim = set;
++      for (size_t slot = set; slot < set + 4; ++slot) {
++        if (cache[slot].id == id) {
++          victim = slot;
++          break;
++        }
++        if (cache[slot].age < cache[victim].age) victim = slot;
++      }
++      cache[victim] = {++clock, id};
++      std::memcpy(cached_rows.data() + victim * width, output + row * width,
++                  width);
++    }
++  }
++
++  void read_batch(Source& source, size_t count) {
++    size_t submitted = 0, active = 0;
++    std::string failure;
++    while ((submitted < count && failure.empty()) || active) {
++      if (submitted < count && failure.empty() && active < queue_depth) {
++        size_t amount = std::min(count - submitted, queue_depth - active);
++        long result = syscall(SYS_io_submit, context, amount,
++                              request_ptrs.data() + submitted);
++        if (result > 0) {
++          submitted += result;
++          active += result;
++        } else if (result < 0 && errno == EINTR) {
++          continue;
++        } else if (result < 0 && errno == EAGAIN && active) {
++          // Drain outstanding requests before retrying submission.
++        } else {
++          failure = "Engram io_submit: " + std::string(std::strerror(errno));
++        }
++      }
++      if (!active) continue;
++      long result = syscall(SYS_io_getevents, context, 1, active,
++                            completions.data(), nullptr);
++      if (result < 0 && errno == EINTR) continue;
++      if (result <= 0) {
++        // io_destroy drains the kernel before this staging buffer is released.
++        syscall(SYS_io_destroy, context);
++        context = 0;
++        throw std::runtime_error("Engram io_getevents failed");
++      }
++      active -= result;
++      for (int i = 0; i < result; ++i) {
++        const auto& event = completions[i];
++        const auto& req = requests[event.data];
++        const uint64_t expected =
++            std::min<uint64_t>(req.aio_nbytes, source.size - req.aio_offset);
++        if (event.res < 0 || uint64_t(event.res) != expected || event.res2) {
++          failure = "Engram direct read failed or checkpoint was truncated (" +
++                    std::to_string(event.res) + ")";
++        } else {
++          stats[5] += event.res;
++          ++stats[6];
++        }
++      }
++    }
++    if (!failure.empty()) throw std::runtime_error(failure);
++  }
++
++  void gather(Source& source, int width, int output_col, int stat) {
++    auto start = Clock::now();
++    pieces.clear();
++    for (int row : misses) {
++      const int64_t id = ids[row];
++      uint64_t offset = source.offset + (id - vocab_start) * width;
++      uint32_t dest = uint64_t(row) * (dim + scale_dim) + output_col;
++      int remaining = width;
++      while (remaining) {
++        const int begin = offset % page_size;
++        const int length = std::min<int>(remaining, page_size - begin);
++        pieces.push_back(
++            {offset / page_size, dest, uint16_t(begin), uint16_t(length)});
++        dest += length;
++        offset += length;
++        remaining -= length;
++      }
++    }
++    std::sort(pieces.begin(), pieces.end(),
++              [](const Piece& a, const Piece& b) { return a.page < b.page; });
++    stats[7] += ns(start);
++    size_t begin = 0;
++    while (begin < pieces.size()) {
++      size_t end = begin, count = 0;
++      while (end < pieces.size() && count < batch_pages) {
++        uint64_t page = pieces[end].page;
++        offsets[count++] = page;
++        while (end < pieces.size() && pieces[end].page == page) ++end;
++      }
++      stats[stat] += count;
++      size_t req_count = 0;
++      for (size_t first = 0; first < count;) {
++        size_t last = first + 1;
++        while (last < count && offsets[last] == offsets[last - 1] + 1 &&
++               last - first < 32)
++          ++last;
++        auto& req = requests[req_count];
++        req = {};
++        req.aio_data = req_count;
++        req.aio_lio_opcode = IOCB_CMD_PREAD;
++        req.aio_fildes = source.fd;
++        req.aio_buf = reinterpret_cast<uint64_t>(pages) + first * page_size;
++        req.aio_nbytes = (last - first) * page_size;
++        req.aio_offset = offsets[first] * page_size;
++        request_ptrs[req_count++] = &req;
++        first = last;
++      }
++      start = Clock::now();
++      read_batch(source, req_count);
++      stats[8] += ns(start);
++      size_t page_index = 0;
++      for (size_t i = begin; i < end; ++i) {
++        const auto& piece = pieces[i];
++        while (offsets[page_index] < piece.page) ++page_index;
++        std::memcpy(
++            output + piece.output,
++            static_cast<uint8_t*>(pages) + page_index * page_size + piece.begin,
++            piece.length);
++      }
++      begin = end;
++    }
++  }
++
++  void run(int rows) {
++    auto start = Clock::now();
++    std::memset(output, 0, size_t(rows) * (dim + scale_dim));
++    if (failed.load(std::memory_order_acquire)) {
++      *status = 1;
++      return;
++    }
++    *status = 0;
++    try {
++      fill_cached(rows);
++      gather(weights, dim, 0, 3);
++      gather(scales, scale_dim, dim, 4);
++      update_cache();
++      ++stats[0];
++      stats[1] += rows;
++      stats[9] += ns(start);
++    } catch (const std::exception& e) {
++      fail(e.what());
++    } catch (...) {
++      fail("Unknown Engram SSD reader error");
++    }
++  }
++};
++
++struct Task {
++  Reader* reader;
++  int rows;
++};
++void CUDART_CB run_task(void* ptr) {
++  auto* task = static_cast<Task*>(ptr);
++  task->reader->run(task->rows);
++}
++thread_local std::string last_error;
++}  // namespace
++
++extern "C" {
++int dsv41_engram_ssd_version() { return 1; }
++void* dsv41_engram_ssd_create(const char* weights, uint64_t weight_offset,
++                              const char* scales, uint64_t scale_offset,
++                              int dim, int scale_dim, int max_rows, int start,
++                              int end, uint64_t cache_bytes, const int32_t* ids,
++                              uint8_t* output, int32_t* status) {
++  try {
++    auto reader = std::make_unique<Reader>(dim, scale_dim, max_rows, start, end,
++                                           cache_bytes, ids, output, status);
++    reader->weights.open_file(weights, weight_offset,
++                              uint64_t(end - start) * dim);
++    reader->scales.open_file(scales, scale_offset,
++                             uint64_t(end - start) * scale_dim);
++    return reader.release();
++  } catch (const std::exception& e) {
++    last_error = e.what();
++    return nullptr;
++  }
++}
++const char* dsv41_engram_ssd_error(void* handle) {
++  if (!handle) return last_error.c_str();
++  auto* reader = static_cast<Reader*>(handle);
++  return reader->failed.load(std::memory_order_acquire) ? reader->error
++                                                        : nullptr;
++}
++void* dsv41_engram_ssd_task(void* handle, int rows) {
++  auto* reader = static_cast<Reader*>(handle);
++  if (rows < 0 || rows > reader->max_rows) return nullptr;
++  return new Task{reader, rows};
++}
++int dsv41_engram_ssd_enqueue(void* task, void* stream) {
++  return cudaLaunchHostFunc(static_cast<cudaStream_t>(stream), run_task, task);
++}
++// Caller synchronizes the owning CUDA stream before reading counters.
++void dsv41_engram_ssd_stats(void* handle, uint64_t* result) {
++  const auto& stats = static_cast<Reader*>(handle)->stats;
++  std::copy(stats.begin(), stats.end(), result);
++}
++// Caller must finish all CUDA work before invalidating the bounded row cache.
++void dsv41_engram_ssd_clear_cache(void* handle) {
++  auto& reader = *static_cast<Reader*>(handle);
++  std::fill(reader.cache.begin(), reader.cache.end(), CacheEntry{});
++  reader.clock = 0;
++}
++void dsv41_engram_ssd_destroy(void* handle, void** tasks, int count) {
++  auto* reader = static_cast<Reader*>(handle);
++  if (!reader) return;
++  int previous = reader->device;
++  cudaGetDevice(&previous);
++  cudaSetDevice(reader->device);
++  cudaDeviceSynchronize();
++  cudaSetDevice(previous);
++  for (int i = 0; i < count; ++i) delete static_cast<Task*>(tasks[i]);
++  delete reader;
++}
++}
+diff --git a/vllm/config/engram.py b/vllm/config/engram.py
+index 6735b30..5a18015 100644
+--- a/vllm/config/engram.py
++++ b/vllm/config/engram.py
+@@ -43,7 +43,18 @@ class EngramConfig:
+     Defaults to False, or VLLM_PLE_CPU_OFFLOAD when set for compatibility.
+     An explicit value takes precedence over the legacy environment variable.
+     For DeepSeek V4.1 each rank offloads its assigned hash heads, so host
+-    table storage and lookup traffic scale with the heads assigned to it."""
++    table storage and lookup traffic scale with the heads assigned to it.
++    Not consulted when `storage` is 'ssd'."""
++
++    storage: str = "ram"
++    """Where the Engram tables physically live: 'ram' keeps them in pinned
++    host memory read over UVA; 'ssd' reads the original checkpoint slices
++    directly from disk with Linux O_DIRECT + AIO and a bounded hot row
++    cache. SSD storage requires TP1 and lazy safetensors loading."""
++
++    engram_cache_gib: float = Field(default=1.0, ge=0)
++    """Total hot row-cache budget in GiB across the model's Engram tables
++    for 'ssd' storage. Capped by the actual table sizes; 0 disables caching."""
+ 
+     embedding_across_dp: bool = False
+     """Shard embeddings across TP and all DP ranks when enabled.
+@@ -75,6 +86,10 @@ class EngramConfig:
+ 
+     def verify_parallel_config(self, parallel_config: "ParallelConfig") -> None:
+         """Reject unsupported embedding parallel topologies."""
++        if self.storage not in ("ram", "ssd"):
++            raise ValueError("EngramConfig.storage must be 'ram' or 'ssd'")
++        if self.storage == "ssd" and parallel_config.tensor_parallel_size != 1:
++            raise ValueError("Engram SSD storage requires tensor_parallel_size == 1")
+         if (
+             self.embedding_across_dp
+             and parallel_config.data_parallel_size > 1
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index cd04ac6..a65d074 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1146,6 +1146,19 @@ class VllmConfig:
+             model_config = speculative_config.target_model_config
+         self.engram_config.verify_model_config(model_config)
+         self.engram_config.verify_parallel_config(self.parallel_config)
++        if self.engram_config.storage == "ssd":
++            if self.load_config.load_format not in ("auto", "safetensors"):
++                raise ValueError(
++                    "Engram SSD storage requires load_format auto/safetensors "
++                    f"got {self.load_config.load_format!r}."
++                )
++            if self.load_config.safetensors_load_strategy not in (None, "lazy"):
++                raise ValueError(
++                    "Engram SSD storage requires lazy (memory-mapped) "
++                    "safetensors loading; eager/prefetch would re-read the "
++                    "whole table into RAM."
++                )
++            self.load_config.safetensors_load_strategy = "lazy"
+         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
+ 
+     def __post_init__(self):
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index abc503f..4ef765f 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -58,6 +58,26 @@ from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32
+ 
+ logger = init_logger(__name__)
+ 
++GiB = 1024**3
++
++
++def plan_engram_cache(
++    cache_gib: float, num_embeddings: tuple[int, ...], head_dim: int
++) -> tuple[int, ...]:
++    """Split the host row-cache budget evenly, capped by FP8 table bytes.
++
++    Ported from the DeepSeek hybrid branch's cache planner: tables that use
++    less than their share return the remainder to the larger ones.
++    """
++    sizes = [rows * (head_dim + head_dim // 32) for rows in num_embeddings]
++    total = sum(sizes)
++    remaining = total if cache_gib >= total / GiB else int(cache_gib * GiB)
++    result = [0] * len(sizes)
++    for rank, index in enumerate(sorted(range(len(sizes)), key=sizes.__getitem__)):
++        result[index] = min(sizes[index], remaining // (len(sizes) - rank))
++        remaining -= result[index]
++    return tuple(result)
++
+ # Cache value for tokens that take no part in an n-gram (image spans).
+ DEAD_ID = -1
+ 
+@@ -755,13 +775,20 @@ class ParallelEngramEmbedding(nn.Module):
+         head_sizes: tuple[int, ...],
+         block_size: int = 32,
+         cpu_offload: bool = False,
++        storage: str = "ram",
++        max_tokens: int = 2048,
++        cache_bytes: int = 0,
+     ):
+         super().__init__()
+         tp_size = get_tensor_model_parallel_world_size()
+         tp_rank = get_tensor_model_parallel_rank()
+         assert head_sizes and all(size > 0 for size in head_sizes)
+         assert sum(head_sizes) <= num_embeddings
+-        if cpu_offload and not is_uva_available():
++        if storage not in ("ram", "ssd"):
++            raise ValueError("Engram storage must be 'ram' or 'ssd'")
++        if storage == "ssd" and tp_size != 1:
++            raise ValueError("Engram SSD currently requires TP1")
++        if cpu_offload and storage == "ram" and not is_uva_available():
+             raise RuntimeError("Engram CPU offload requires UVA support")
+         self.num_embeddings = num_embeddings
+         self.dim = dim
+@@ -775,6 +802,7 @@ class ParallelEngramEmbedding(nn.Module):
+         self.part_num_embeddings = self.vocab_end_idx - self.vocab_start_idx
+         self.tp_size = tp_size
+         self.cpu_offload = cpu_offload
++        self.ssd = None
+         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
+         self._view_src: tuple[int, int] | None = None
+         self._num_sms = torch.cuda.get_device_properties(
+@@ -797,23 +825,57 @@ class ParallelEngramEmbedding(nn.Module):
+                 )
+             return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+ 
++        if storage == "ssd":
++            from .engram_ssd import EngramSSD
++
++            self.ssd = EngramSSD(
++                dim,
++                block_size,
++                self.part_n_hash_cols,
++                max_tokens,
++                self.vocab_start_idx,
++                self.vocab_end_idx,
++                cache_bytes,
++            )
++            # Retain checkpoint names and shapes without allocating the table;
++            # the SSD weight loader records file slices instead of copying.
++            def _meta_alloc(
++                shape: tuple[int, ...], dtype: torch.dtype
++            ) -> torch.Tensor:
++                return torch.empty(shape, dtype=dtype, device="meta")
++
++            alloc = _meta_alloc
++        else:
++            alloc = _alloc
++
+         self.weight = nn.Parameter(
+-            _alloc((self.part_num_embeddings, dim), torch.float8_e4m3fn),
++            alloc((self.part_num_embeddings, dim), torch.float8_e4m3fn),
+             requires_grad=False,
+         )
+         self.weight_scale_inv = nn.Parameter(
+-            _alloc((self.part_num_embeddings, dim // block_size), torch.uint8),
++            alloc((self.part_num_embeddings, dim // block_size), torch.uint8),
+             requires_grad=False,
+         )
+         for param in (self.weight, self.weight_scale_inv):
+             set_weight_attrs(
+                 param,
+                 {
+-                    "weight_loader": _engram_head_shard_weight_loader,
++                    "weight_loader": (
++                        self.ssd.load if self.ssd else _engram_head_shard_weight_loader
++                    ),
+                     "engram_vocab_start": self.vocab_start_idx,
+                 },
+             )
+-        if cpu_offload:
++        if self.ssd is not None:
++            logger.info(
++                "Engram table stored on SSD via direct I/O: %d rows x %d, "
++                "%.2f GiB on disk per rank, row cache %.1f MiB",
++                self.part_num_embeddings,
++                dim,
++                self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
++                cache_bytes / 1024**2,
++            )
++        elif cpu_offload:
+             logger.info(
+                 "Engram table offloaded to pinned host memory: %d rows x %d, "
+                 "%.2f GiB per rank",
+@@ -850,6 +912,9 @@ class ParallelEngramEmbedding(nn.Module):
+         rows = indices.shape[0] * self.part_n_hash_cols
+         if not rows:
+             return
++        if self.ssd is not None:
++            self.ssd.lookup(indices, out, background=background)
++            return
+         weight, scales = self._storage()
+         # The table dwarfs TLB reach, so a persistent grid near the SM count
+         # beats one program per row; halve it to leave SMs for the main stream.
+@@ -1033,12 +1098,20 @@ class Engram(nn.Module):
+         # Named ``embed_tokens`` so the checkpoint's ``engram.embed.weight``
+         # survives the mapper's ``embed.weight`` -> ``embed_tokens.weight``
+         # suffix rule.
+-        engram_config = get_current_vllm_config().engram_config
++        vllm_config = get_current_vllm_config()
++        engram_config = vllm_config.engram_config
+         self.embed_tokens = ParallelEngramEmbedding(
+             layout.num_embeddings[layer_hash_index],
+             layout.head_dim,
+             tuple(size for order in layout.primes[layer_hash_index] for size in order),
+             cpu_offload=engram_config.cpu_offload if engram_config else True,
++            storage=engram_config.storage if engram_config else "ram",
++            max_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
++            cache_bytes=plan_engram_cache(
++                engram_config.engram_cache_gib if engram_config else 1,
++                layout.num_embeddings,
++                layout.head_dim,
++            )[layer_hash_index],
+         )
+         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
+         self.wkv = ReplicatedLinear(
+@@ -1068,11 +1141,21 @@ class Engram(nn.Module):
+         )
+ 
+     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
+-        """Gather this layer's rows on the main stream before decoder layers."""
+-        self.embed_tokens.lookup(hash_ids, self.staged_rows[: hash_ids.shape[0]])
++        """Gather this layer's rows before the decoder layers consume them.
++
++        SSD reads are submitted on a side stream and overlap the preceding
++        local layers; the UVA path gathers on the main stream.
++        """
++        self.embed_tokens.lookup(
++            hash_ids,
++            self.staged_rows[: hash_ids.shape[0]],
++            background=self.embed_tokens.ssd is not None,
++        )
+ 
+     def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
+         """Gather heads, returning only local tokens when SP is enabled."""
++        if self.embed_tokens.ssd is not None:
++            self.embed_tokens.ssd.wait()
+         rows = self.staged_rows[: hash_ids.shape[0]]
+         if self.embed_tokens.tp_size == 1:
+             return rows
+diff --git a/vllm/models/deepseek_v4_1/common/engram_ssd.py b/vllm/models/deepseek_v4_1/common/engram_ssd.py
+new file mode 100644
+index 0000000..3aaffff
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/common/engram_ssd.py
+@@ -0,0 +1,316 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Bounded direct-I/O Engram lookup from the original safetensors files."""
++
++import ctypes
++import os
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++
++from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
++from vllm.config import CUDAGraphMode
++from vllm.forward_context import get_forward_context, is_forward_context_available
++from vllm.logger import init_logger
++from vllm.triton_utils import tl, triton
++from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32
++
++logger = init_logger(__name__)
++
++
++def _capture_with_breaks():
++    capture = BreakableCUDAGraphCapture.current()
++    if capture is None or not capture._capturing:
++        return None
++    if is_forward_context_available() and (
++        get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
++    ):
++        return None
++    return capture
++
++
++def checkpoint_slice(tensor: torch.Tensor) -> tuple[str, int]:
++    """Locate a contiguous mmap view without touching its checkpoint pages."""
++    if tensor.device.type != "cpu" or not tensor.is_contiguous():
++        raise ValueError("Engram SSD requires contiguous CPU safetensors views")
++    base = tensor.data_ptr()
++    size = tensor.numel() * tensor.element_size()
++    for line in Path("/proc/self/maps").read_text().splitlines():
++        fields = line.split(maxsplit=5)
++        # Hugging Face snapshots point at suffixless blob files in /proc/maps.
++        if (
++            len(fields) != 6
++            or fields[4] == "0"
++            or not fields[1].endswith("p")
++            or not fields[5].startswith("/")
++        ):
++            continue
++        first, last = (int(x, 16) for x in fields[0].split("-"))
++        if first <= base < base + size <= last:
++            path = fields[5]
++            if os.stat(path).st_ino != int(fields[4]):
++                raise RuntimeError("Engram checkpoint changed during loading")
++            return path, int(fields[2], 16) + base - first
++    raise ValueError(
++        "Engram SSD requires mmap safetensors loading; the source tensor "
++        "is not a file-backed view"
++    )
++
++
++@lru_cache
++def _library():
++    import vllm
++
++    path = Path(vllm.__file__).parent / "libdsv41_cuda.so"
++    if not path.is_file():
++        raise RuntimeError(
++            "Engram SSD native library is not installed; build the "
++            "libdsv41_cuda target (csrc/cpu/dsv41/engram_ssd.cpp) and place "
++            "it next to the vllm package."
++        )
++    library = ctypes.CDLL(str(path))
++    ptr, integer, u64 = ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64
++    if not hasattr(library, "dsv41_engram_ssd_version") or (
++        library.dsv41_engram_ssd_version() != 1
++    ):
++        raise RuntimeError("Rebuild libdsv41_cuda to enable Engram SSD storage")
++    signatures = {
++        "create": (
++            [ctypes.c_char_p, u64, ctypes.c_char_p, u64]
++            + [integer] * 5
++            + [u64]
++            + [ptr] * 3,
++            ptr,
++        ),
++        "error": ([ptr], ctypes.c_char_p),
++        "task": ([ptr, integer], ptr),
++        "enqueue": ([ptr, ptr], integer),
++        "stats": ([ptr, ptr], None),
++        "clear_cache": ([ptr], None),
++        "destroy": ([ptr, ptr, integer], None),
++    }
++    for name, (args, result) in signatures.items():
++        function = getattr(library, f"dsv41_engram_ssd_{name}")
++        function.argtypes, function.restype = args, result
++    return library
++
++
++@triton.jit
++def _unpack_rows(
++    raw,
++    status,
++    output,
++    rows,
++    DIM: tl.constexpr,
++    QUANT_BLOCK: tl.constexpr,
++    BLOCK_R: tl.constexpr,
++):
++    # I/O failures must terminate inference, including during graph replay.
++    tl.device_assert(tl.load(status) == 0, "Engram SSD I/O failed")
++    row = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
++    col = tl.arange(0, DIM)
++    stride: tl.constexpr = DIM + DIM // QUANT_BLOCK
++    values = tl.load(
++        raw + row[:, None] * stride + col[None, :], mask=row[:, None] < rows, other=0
++    )
++    values = _decode_fp8_f32(values, False)
++    scale = tl.load(
++        raw + row[:, None] * stride + DIM + col[None, :] // QUANT_BLOCK,
++        mask=row[:, None] < rows,
++        other=0,
++    )
++    scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
++    tl.store(
++        output + row[:, None] * DIM + col[None, :],
++        (values * scale).to(tl.bfloat16),
++        mask=row[:, None] < rows,
++    )
++
++
++class EngramSSD:
++    """One serial I/O stream and fixed workspaces per local Engram table.
++
++    Graph host nodes read the current IDs on every replay. Only row bytes are
++    staged; request histories, speculation and rollback remain with the model.
++    """
++
++    def __init__(
++        self, dim, block_size, heads, max_tokens, vocab_start, vocab_end, cache_bytes=0
++    ):
++        from ..host_memory import check_host_headroom
++
++        self.dim, self.block_size, self.heads = dim, block_size, heads
++        self.max_rows = max_tokens * heads
++        self.start, self.end = vocab_start, vocab_end
++        self.row_bytes = dim + dim // block_size
++        self.cache_bytes = cache_bytes
++        if self.max_rows * self.row_bytes > 2**32 - 1:
++            raise ValueError("Engram SSD staging exceeds 4 GiB per table")
++        check_host_headroom(
++            self.max_rows * (self.row_bytes + 40) + 4 * 1024**2 + cache_bytes
++        )
++        self.library = _library()
++        self.handle = None
++        self.tasks = {}
++        self.sources = {}
++        self.stream = torch.cuda.Stream()
++        self.ready = torch.cuda.Event()
++        self.ids = torch.empty(
++            self.max_rows, dtype=torch.int32, device="cpu", pin_memory=True
++        )
++        self.raw = torch.empty(
++            self.max_rows,
++            self.row_bytes,
++            dtype=torch.uint8,
++            device="cpu",
++            pin_memory=True,
++        )
++        self.status = torch.zeros(1, dtype=torch.int32, device="cpu", pin_memory=True)
++        self.device_raw = torch.empty_like(self.raw, device="cuda")
++        self.device_status = torch.empty_like(self.status, device="cuda")
++
++    def load(self, param: torch.nn.Parameter, tensor: torch.Tensor):
++        width = param.shape[1]
++        expected_dtype = (
++            torch.float8_e4m3fn if width == self.dim else torch.float8_e8m0fnu
++        )
++        if tensor.dtype not in (expected_dtype, torch.uint8):
++            raise ValueError(f"Unexpected Engram SSD dtype: {tensor.dtype}")
++        shard = tensor.narrow(0, self.start, self.end - self.start)
++        if shard.shape != param.shape:
++            raise ValueError("Engram SSD checkpoint shape does not match the model")
++        self.sources[width] = checkpoint_slice(shard)
++        if len(self.sources) != 2:
++            return
++        if self.handle is not None:
++            raise RuntimeError("Engram SSD does not support in-place weight reload")
++        weights, weight_offset = self.sources[self.dim]
++        scales, scale_offset = self.sources[self.dim // self.block_size]
++        self.handle = self.library.dsv41_engram_ssd_create(
++            os.fsencode(weights),
++            weight_offset,
++            os.fsencode(scales),
++            scale_offset,
++            self.dim,
++            self.dim // self.block_size,
++            self.max_rows,
++            self.start,
++            self.end,
++            self.cache_bytes,
++            self.ids.data_ptr(),
++            self.raw.data_ptr(),
++            self.status.data_ptr(),
++        )
++        if not self.handle:
++            raise RuntimeError(self.library.dsv41_engram_ssd_error(None).decode())
++        logger.info(
++            "Engram SSD: O_DIRECT + Linux AIO (not GDS), %.2f GiB on disk, "
++            "host workspace ~%.1f MiB, GPU workspace %.1f MiB, "
++            "bounded row cache %.1f MiB; %s",
++            (self.end - self.start) * self.row_bytes / 1024**3,
++            (self.max_rows * (self.row_bytes + 40) + 4 * 1024**2) / 1024**2,
++            self.device_raw.numel() / 1024**2,
++            self.cache_bytes / 1024**2,
++            weights,
++        )
++
++    def check_errors(self):
++        error = self.library.dsv41_engram_ssd_error(self.handle)
++        if error:
++            raise RuntimeError(error.decode())
++
++    def lookup(self, indices, output, *, background=False):
++        from vllm.utils.torch_utils import weak_ref_tensor
++
++        capture = _capture_with_breaks()
++        if capture is not None:
++            # A side stream cannot remain forked when an attention graph segment
++            # ends. Keep submission and consumption as explicit replay actions.
++            ids, out = weak_ref_tensor(indices), weak_ref_tensor(output)
++            capture.add_eager(lambda: self.lookup(ids, out, background=background))
++            return
++        if self.handle is None:
++            raise RuntimeError("Engram SSD weights have not been loaded")
++        self.check_errors()
++        rows = indices.numel()
++        if rows > self.max_rows or indices.dtype != torch.int32:
++            raise ValueError("Engram SSD row IDs exceed workspace or are not int32")
++        if not rows:
++            return
++        if rows not in self.tasks:
++            self.tasks[rows] = self.library.dsv41_engram_ssd_task(self.handle, rows)
++            if not self.tasks[rows]:
++                raise RuntimeError("Cannot create Engram SSD graph host node")
++        main = torch.cuda.current_stream()
++        # Also fence the preceding forward's consumer before reusing buffers.
++        # Captured paths fork and join this stream, including graph breaks.
++        self.stream.wait_stream(main)
++        with torch.cuda.stream(self.stream):
++            self.ids[:rows].copy_(indices.reshape(-1), non_blocking=True)
++            rc = self.library.dsv41_engram_ssd_enqueue(
++                self.tasks[rows], self.stream.cuda_stream
++            )
++            if rc:
++                raise RuntimeError(f"Cannot enqueue Engram SSD read: CUDA {rc}")
++            self.device_raw[:rows].copy_(self.raw[:rows], non_blocking=True)
++            self.device_status.copy_(self.status, non_blocking=True)
++            _unpack_rows[(triton.cdiv(rows, 16),)](
++                self.device_raw,
++                self.device_status,
++                output,
++                rows,
++                DIM=self.dim,
++                QUANT_BLOCK=self.block_size,
++                BLOCK_R=16,
++                debug=True,
++            )
++            self.ready.record(self.stream)
++        if not background:
++            self.wait()
++
++    def wait(self):
++        capture = _capture_with_breaks()
++        if capture is not None:
++            capture.add_eager(self.wait)
++            return
++        torch.cuda.current_stream().wait_event(self.ready)
++
++    def stats(self):
++        """Return counters once all consuming streams have completed."""
++        values = (ctypes.c_uint64 * 11)()
++        self.library.dsv41_engram_ssd_stats(self.handle, values)
++        return dict(
++            zip(
++                (
++                    "calls",
++                    "rows",
++                    "valid_rows",
++                    "weight_pages",
++                    "scale_pages",
++                    "read_bytes",
++                    "read_ops",
++                    "planning_ns",
++                    "io_ns",
++                    "callback_ns",
++                    "cached_rows",
++                ),
++                values,
++            )
++        )
++
++    def clear_cache(self):
++        # Graph replay may execute the callback on an internal CUDA stream.
++        torch.accelerator.synchronize(self.device_raw.device)
++        self.library.dsv41_engram_ssd_clear_cache(self.handle)
++
++    def close(self):
++        if self.handle:
++            tasks = (ctypes.c_void_p * len(self.tasks))(*self.tasks.values())
++            self.library.dsv41_engram_ssd_destroy(self.handle, tasks, len(tasks))
++            self.handle = None
++            self.tasks.clear()
++
++    def __del__(self):
++        if getattr(self, "handle", None):
++            self.close()
+diff --git a/vllm/models/deepseek_v4_1/host_memory.py b/vllm/models/deepseek_v4_1/host_memory.py
+new file mode 100644
+index 0000000..d35f525
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/host_memory.py
+@@ -0,0 +1,44 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Host memory headroom guards for bounded Engram offloads."""
++
++from pathlib import Path
++
++GiB = 1024**3
++
++
++def host_available_bytes() -> int:
++    info = dict(
++        line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines()
++    )
++    return int(info["MemAvailable"].split()[0]) * 1024
++
++
++def check_host_headroom(additional_bytes=0):
++    """Stop an allocation that would push the host close to exhausting RAM."""
++    if host_available_bytes() < 64 * GiB + additional_bytes:
++        raise RuntimeError(
++            "DeepSeek Engram host allocation stopped before exhausting RAM: "
++            "64 GiB of available memory must remain"
++        )
++    entry = next(
++        (
++            line[3:]
++            for line in Path("/proc/self/cgroup").read_text().splitlines()
++            if line.startswith("0::")
++        ),
++        None,
++    )
++    if entry is None:
++        return
++    path = Path("/sys/fs/cgroup") / entry.lstrip("/")
++    while path != Path("/sys/fs"):
++        limit_path = path / "memory.max"
++        if limit_path.is_file():
++            limit = limit_path.read_text().strip()
++            used = int((path / "memory.current").read_text())
++            if limit != "max" and used + additional_bytes + 8 * GiB > int(limit):
++                raise RuntimeError(
++                    "DeepSeek Engram host allocation exceeds cgroup headroom"
++                )
++        path = path.parent
